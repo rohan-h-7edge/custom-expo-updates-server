@@ -1,0 +1,168 @@
+org: rohanhalesh1
+app: expo-updates
+service: expo-updates-server
+
+frameworkVersion: '4'
+
+plugins:
+  - serverless-offline
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  region: ap-south-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 30
+
+  environment:
+    AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+    S3_BUCKET_NAME: !Ref UpdatesBucket
+    PRIVATE_KEY_SECRET_ARN: arn:aws:secretsmanager:ap-south-1:483146682701:secret:expo-updates/code-signing-private-key-kIpRYj
+    ASSETS_BASE_URL: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  iam:
+    role:
+      statements:
+        # Read update bundles from S3
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:ListBucket
+          Resource:
+            - !GetAtt UpdatesBucket.Arn
+            - !Sub '${UpdatesBucket.Arn}/*'
+        # Read private key from Secrets Manager
+        - Effect: Allow
+          Action:
+            - secretsmanager:GetSecretValue
+          Resource:
+            - arn:aws:secretsmanager:ap-south-1:483146682701:secret:expo-updates/code-signing-private-key-kIpRYj
+
+build:
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: false
+    target: node22
+
+custom:
+  serverless-offline:
+    httpPort: 3000
+    noPrependStageInUrl: true
+
+# ── Lambda functions ────────────────────────────────────────────────────────
+functions:
+  manifest:
+    handler: src/handlers/manifest.handler
+    description: Serves expo-updates manifests
+    events:
+      - httpApi:
+          path: /api/manifest
+          method: GET
+
+# ── AWS Resources (S3 + CloudFront) ─────────────────────────────────────────
+resources:
+  Resources:
+
+    # ── S3: Update bundles ─────────────────────────────────────────────────
+    UpdatesBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain
+      Properties:
+        BucketName: expo-updates-${aws:accountId}-${aws:region}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        VersioningConfiguration:
+          Status: Enabled
+        LifecycleConfiguration:
+          Rules:
+            - Id: ExpireOldVersions
+              Status: Enabled
+              NoncurrentVersionExpiration:
+                NoncurrentDays: 30
+
+    # Bucket policy: allow only CloudFront OAC to read objects
+    UpdatesBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref UpdatesBucket
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: cloudfront.amazonaws.com
+              Action: s3:GetObject
+              Resource: !Sub '${UpdatesBucket.Arn}/*'
+              Condition:
+                StringEquals:
+                  AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+    # ── CloudFront Origin Access Control ──────────────────────────────────
+    S3OriginAccessControl:
+      Type: AWS::CloudFront::OriginAccessControl
+      Properties:
+        OriginAccessControlConfig:
+          Name: expo-updates-s3-oac-${sls:stage}
+          OriginAccessControlOriginType: s3
+          SigningBehavior: always
+          SigningProtocol: sigv4
+
+    # ── CloudFront Distribution ────────────────────────────────────────────
+    CloudFrontDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Comment: Expo Updates CDN - ${sls:stage}
+          Enabled: true
+          HttpVersion: http2
+          # Default behaviour → API Gateway (manifest endpoint)
+          DefaultCacheBehavior:
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled managed policy
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            Compress: true
+          # /api/assets/* → S3 directly (no Lambda, long cache)
+          CacheBehaviors:
+            - PathPattern: api/assets/*
+              TargetOriginId: S3Origin
+              ViewerProtocolPolicy: redirect-to-https
+              CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized managed policy
+              AllowedMethods: [GET, HEAD]
+              Compress: true
+          Origins:
+            - Id: ApiGatewayOrigin
+              DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+              CustomOriginConfig:
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+            - Id: S3Origin
+              DomainName: !Sub '${UpdatesBucket}.s3.${AWS::Region}.amazonaws.com'
+              OriginAccessControlId: !GetAtt S3OriginAccessControl.Id
+              S3OriginConfig:
+                OriginAccessIdentity: ''
+          PriceClass: PriceClass_100
+
+  Outputs:
+    CloudFrontURL:
+      Description: Use this as updates.url base in app.json
+      Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+    ManifestEndpoint:
+      Description: Full manifest endpoint for expo-updates client
+      Value: !Sub 'https://${CloudFrontDistribution.DomainName}/api/manifest'
+
+    UpdatesBucketName:
+      Description: S3 bucket — upload update bundles here
+      Value: !Ref UpdatesBucket

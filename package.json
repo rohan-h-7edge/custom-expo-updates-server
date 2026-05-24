@@ -1,0 +1,9 @@
+{
+  "workspaces": [
+    "server",
+    "updates-client"
+  ],
+  "devDependencies": {
+    "baseline-browser-mapping": "^2.10.32"
+  }
+}

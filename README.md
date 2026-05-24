@@ -1,69 +1,334 @@
-# Custom Expo Updates Server & Client
+# Custom Expo Updates Server
 
-This repo contains a server and client that implement the [Expo Updates protocol specification](https://docs.expo.dev/technical-specs/expo-updates-0).
+Production-ready OTA (Over-The-Air) update server for Expo apps built on AWS serverless infrastructure. Implements the [Expo Updates protocol v1](https://docs.expo.dev/technical-specs/expo-updates-1).
 
-> [!IMPORTANT]
-> This repo exists to provide a basic demonstration of how the protocol might be translated to code. It is not guaranteed to be complete, stable, or performant enough to use as a full-fledged backend for expo-updates. Expo does not provide hands-on technical support for custom expo-updates server implementations, including what is in this repo. Issues within the expo-updates client library itself (independent of server) may be reported at https://github.com/expo/expo/issues/new/choose. Any pull requests that add new features to this repository will likely be closed; instead, feel free to fork the repository to add new features.
+---
 
-## Why
+## Architecture
 
-Expo provides a set of service named EAS (Expo Application Services), one of which is EAS Update which can host and serve updates for an Expo app using the [`expo-updates`](https://github.com/expo/expo/tree/main/packages/expo-updates) library.
+```
+Mobile App (expo-updates)
+        │
+        ▼
+  CloudFront (CDN)
+        │
+        ├─ /api/manifest ──▶ API Gateway ──▶ Lambda ──▶ S3 (reads metadata)
+        │                                         │
+        │                                   Secrets Manager (signing key)
+        │
+        └─ /api/assets/* ──▶ S3 directly (no Lambda, cached 1 year)
+```
 
-In some cases more control of how updates are sent to an app may be needed, and one option is to implement a custom updates server that adheres to the specification in order to serve update manifests and assets. This repo contains an example server implementation of the specification and a client app configured to use the example server.
+| Component | Technology |
+|---|---|
+| Manifest API | AWS Lambda (Node.js 22) |
+| Asset storage | AWS S3 |
+| CDN | AWS CloudFront |
+| Code signing key | AWS Secrets Manager |
+| Infrastructure | Serverless Framework v4 |
+| Client | Expo SDK 56 + expo-updates |
 
-## Getting started
+---
 
-### Updates overview
+## Folder Structure
 
-To understand this repo, it's important to understand some terminology around updates:
+```
+custom-expo-updates-server/
+├── package.json                        # npm workspace root
+│
+├── server/                             # Lambda backend
+│   ├── serverless.yml                  # Infrastructure: Lambda, API Gateway, S3, CloudFront
+│   ├── tsconfig.json
+│   ├── src/
+│   │   ├── handlers/
+│   │   │   └── manifest.ts             # Lambda entry point — expo-updates manifest protocol
+│   │   └── lib/
+│   │       ├── helpers.ts              # Manifest building, S3 path resolution, directives
+│   │       ├── s3.ts                   # S3 client (get, put, list, exists)
+│   │       ├── logger.ts               # Writes per-request JSON logs to S3
+│   │       └── signing.ts              # RSA-SHA256 code signing via Secrets Manager
+│   ├── events/
+│   │   └── manifest-get.json           # Test event for local sls invoke
+│   └── __tests__/
+│
+└── updates-client/                     # Expo React Native app
+    ├── App.js                          # Main screen
+    ├── app.json                        # Points updates.url to CloudFront manifest
+    ├── metro.config.js                 # Workspace-aware Metro config
+    ├── index.js
+    ├── publish.sh                      # OTA publish + rollback script
+    ├── code-signing/
+    │   └── certificate.pem             # Public cert bundled in app (verifies signed manifests)
+    └── assets/                         # Icons, splash screens
+```
 
-- **Runtime version**: Type: String. Runtime version specifies the version of the underlying native code your app is running. You'll want to update the runtime version of an update when it relies on new or changed native code, like when you update the Expo SDK, or add in any native modules into your apps. Failing to update an update's runtime version will cause your end-user's app to crash if the update relies on native code the end-user is not running.
-- **Platform**: Type: "ios" or "android". Specifies which platform to to provide an update.
-- **Manifest**: Described in the protocol. The manifest is an object that describes assets and other details that an Expo app needs to know to load an update.
+---
 
-### How the `expo-update-server` works
+## Prerequisites
 
-The flow for creating an update is as follows:
+- Node.js 18+
+- AWS CLI configured (`aws configure`)
+- Serverless Framework v4 (`npm i -g serverless`)
 
-1. Configure and build a "release" version of an app, then run it on a simulator or deploy to an app store.
-2. Run the project locally, make changes, then export the app as an update.
-3. In the server repo, we'll copy the update made in #2 to the **expo-update-server/updates** directory, under a corresponding runtime version sub-directory.
-4. In the "release" app, force close and reopen the app to make a request for an update from the custom update server. The server will return a manifest that matches the requests platform and runtime version.
-5. Once the "release" app receives the manifest, it will then make requests for each asset, which will also be served from this server.
-6. Once the app has all the required assets it needs from the server, it will load the update.
+---
 
-## The setup
+## New Project Setup
 
-Note: The app is configured to load updates from the server running at http://localhost:3000. If you prefer to load them from a different base URL (for example, in an Android emulator):
-1. Update `.env.local` in the server.
-2. Update `updates.url` in `app.json` and re-run the build steps below.
+Follow these steps in order when setting up this server for a new app.
 
-### Create a "release" app
+### 1. Clone & install
 
-The example Expo project configured for the server is located in **/expo-updates-client**.
+```bash
+git clone <repo>
+cd custom-expo-updates-server
+npm install
+```
 
-#### iOS
+### 2. Generate code signing key pair
 
-Run `yarn` and `yarn ios --configuration Release`.
+```bash
+cd updates-client
+npx expo-updates codesigning:generate \
+  --key-output-directory ../keys \
+  --certificate-output-directory code-signing \
+  --certificate-validity-duration-years 10 \
+  --certificate-common-name "Your App Name"
+```
 
-#### Android
+| Output | What to do |
+|---|---|
+| `code-signing/certificate.pem` | Commit this — bundled into the app |
+| `keys/private-key.pem` | **Never commit** — upload to Secrets Manager (next step) |
 
-Run `yarn` and then run `yarn android --variant release`.
+### 3. Upload private key to Secrets Manager
 
-### Make a change
+```bash
+aws secretsmanager create-secret \
+  --name "expo-updates/code-signing-private-key" \
+  --secret-string file://../keys/private-key.pem \
+  --region ap-south-1
+```
 
-Let's make a change to the project in /expo-updates-client that we'll want to push as an over-the-air update from our custom server to the "release" app. `cd` in to **/expo-updates-client**, then make a change in **App.js**.
+Copy the returned `ARN` for the next two steps.
 
-Once you've made a change you're happy with, inside of **/expo-updates-server**, run `yarn expo-publish`. Under the hood, this script runs `npx expo export` in the client, copies the exported app to the server, and then copies the Expo config to the server as well.
+### 4. Update `server/serverless.yml`
 
-### Send an update
+Replace the secret ARN in **both** places (environment + IAM resource):
 
-Now we're ready to run the update server. Run `yarn dev` in the server folder of this repo to start the server.
+```yaml
+org: your-org-name
+app: your-app-name
 
-In the simulator running the "release" version of the app, force close the app and re-open it. It should make a request to /api/manifest, then requests to /api/assets. After the app loads, it should show any changes you made locally.
+PRIVATE_KEY_SECRET_ARN: arn:aws:secretsmanager:ap-south-1:YOUR_ACCOUNT:secret:expo-updates/...
+```
 
-## About this server
+### 5. Update `updates-client/app.json`
 
-This server was created with NextJS. You can find the API endpoints in **pages/api/manifest.js** and **pages/api/assets.js**.
+```json
+{
+  "expo": {
+    "name": "your-app-name",
+    "slug": "your-app-slug",
+    "runtimeVersion": "1",
+    "ios": { "bundleIdentifier": "com.yourcompany.appname" },
+    "android": { "package": "com.yourcompany.appname" }
+  }
+}
+```
 
-The code signing keys and certificates were generated using https://github.com/expo/code-signing-certificates.
+### 6. Deploy to AWS
+
+```bash
+cd server
+sls deploy
+```
+
+From the outputs, copy `ManifestEndpoint` (e.g. `https://xxxx.cloudfront.net/api/manifest`) and set it in `updates-client/app.json` → `expo.updates.url`.
+
+### 7. Update `updates-client/publish.sh`
+
+```bash
+BUCKET="expo-updates-YOUR_ACCOUNT_ID-ap-south-1"   # line 4
+```
+
+### 8. Create `server/.env.local` for local development
+
+```bash
+AWS_REGION=ap-south-1
+S3_BUCKET_NAME=expo-updates-YOUR_ACCOUNT_ID-ap-south-1
+PRIVATE_KEY_SECRET_ARN=arn:aws:secretsmanager:...
+ASSETS_BASE_URL=http://localhost:3000
+```
+
+### 9. Build the native app
+
+```bash
+cd updates-client
+npx expo run:android    # or run:ios
+```
+
+This bakes the `runtimeVersion` and `updates.url` into the native binary.
+
+### 10. Publish your first OTA update
+
+```bash
+./publish.sh
+```
+
+### Files to change per project
+
+| File | What to update |
+|---|---|
+| `server/serverless.yml` | `org`, `app`, `PRIVATE_KEY_SECRET_ARN` (×2) |
+| `server/.env.local` | `S3_BUCKET_NAME`, `PRIVATE_KEY_SECRET_ARN` |
+| `updates-client/app.json` | `name`, `slug`, `updates.url`, bundle IDs, `runtimeVersion` |
+| `updates-client/publish.sh` | `BUCKET` |
+| `updates-client/code-signing/certificate.pem` | Replace with newly generated cert |
+
+---
+
+## Existing Project Setup
+
+### 1. Install dependencies
+
+```bash
+npm install          # installs all workspaces from repo root
+```
+
+### 2. Deploy to AWS
+
+```bash
+cd server
+sls deploy
+```
+
+Note the outputs — copy `CloudFrontURL` into `updates-client/app.json` → `expo.updates.url`.
+
+---
+
+## Publishing an Update
+
+```bash
+cd updates-client
+./publish.sh            # export → upload to S3 → invalidate CloudFront
+```
+
+### Rollback (revert all devices to embedded bundle)
+
+```bash
+./publish.sh rollback
+```
+
+This uploads a zero-byte `rollback` sentinel to a new timestamp directory. All devices revert to the JS bundle baked into their native binary on the next update check. To recover, run `./publish.sh` again with a fix.
+
+---
+
+## S3 Structure
+
+```
+s3://expo-updates-<accountId>-ap-south-1/
+├── updates/
+│   └── {runtimeVersion}/              e.g. "1"
+│       └── {unix-timestamp}/          highest timestamp = latest update
+│           ├── metadata.json
+│           ├── expoConfig.json
+│           ├── bundles/
+│           │   └── android-<hash>.js
+│           └── assets/
+│
+├── api/
+│   └── assets/
+│       └── {md5}.{ext}                content-addressed flat namespace
+│                                      served directly by CloudFront → S3
+└── logs/
+    └── {YYYY-MM-DD}/
+        └── {timestamp}_{requestId}.json   per-request manifest logs
+```
+
+---
+
+## Request Logs
+
+Every manifest request writes a structured JSON log to `s3://…/logs/YYYY-MM-DD/`.
+
+```json
+{
+  "requestId": "abc123",
+  "timestamp": "2026-05-24T10:00:00.000Z",
+  "platform": "android",
+  "runtimeVersion": "1",
+  "currentUpdateId": "xxxxxxxx-…",
+  "outcome": "update_served",
+  "statusCode": 200,
+  "updateBundlePath": "updates/1/1716000000",
+  "manifestId": "xxxxxxxx-…"
+}
+```
+
+| `outcome` | Meaning |
+|---|---|
+| `update_served` | New update sent to device |
+| `no_update` | Device already has latest |
+| `rollback` | Rollback directive sent |
+| `not_found` | No update for this `runtimeVersion` |
+| `bad_request` | Missing or invalid headers |
+| `error` | Unexpected server error |
+
+```bash
+# View today's logs
+aws s3 sync s3://expo-updates-483146682701-ap-south-1/logs/$(date +%Y-%m-%d)/ /tmp/expo-logs/ --region ap-south-1
+cat /tmp/expo-logs/*.json
+```
+
+---
+
+## Local Development
+
+```bash
+cd server
+cp .env.local.example .env.local    # fill in bucket name, secret ARN, etc.
+
+# Invoke the handler directly
+sls invoke local -f manifest -p events/manifest-get.json
+
+# Run a local HTTP server
+sls offline
+# → http://localhost:3000/api/manifest
+```
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `S3_BUCKET_NAME` | Resolved from CloudFormation at deploy time |
+| `PRIVATE_KEY_SECRET_ARN` | ARN of the Secrets Manager secret |
+| `ASSETS_BASE_URL` | CloudFront domain (or `http://localhost:3000` locally) |
+
+---
+
+## Code Signing
+
+Manifests are signed with RSA-SHA256. The private key lives in Secrets Manager. The matching public certificate is bundled in the client at `code-signing/certificate.pem`. If the signature doesn't verify, `expo-updates` rejects the update entirely.
+
+To generate a new key pair:
+
+```bash
+npx expo-updates codesigning:generate \
+  --key-output-directory keys \
+  --certificate-output-directory certs \
+  --certificate-validity-duration-years 10 \
+  --certificate-common-name "Expo Updates"
+```
+
+---
+
+## Security
+
+| Threat | Mitigation |
+|---|---|
+| Malicious update injection | RSA-SHA256 code signing verified on device |
+| Private key exposure | Stored in Secrets Manager, never in code |
+| Direct S3 access | CloudFront OAC — S3 rejects all direct requests |
+| Stale manifest cache | `cache-control: private, max-age=0` on every manifest response |
+| Asset tampering | Content-addressed keys + hash verified by expo-updates |
+| Over-privileged Lambda | IAM role scoped to one bucket + one secret ARN |

@@ -1,0 +1,36 @@
+{
+  "name": "expo-updates-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "test": "jest",
+    "lint": "eslint src",
+    "deploy": "sls deploy",
+    "deploy:prod": "sls deploy --stage prod",
+    "local": "sls invoke local -f manifest -p events/manifest-get.json",
+    "remove": "sls remove"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "form-data": "^4.0.0",
+    "mime": "^2.6.0",
+    "structured-headers": "^0.4.1"
+  },
+  "devDependencies": {
+    "@aws-sdk/types": "^3.600.0",
+    "@expo/multipart-body-parser": "^2.0.0",
+    "@types/aws-lambda": "^8.10.140",
+    "@types/jest": "^29.5.12",
+    "@types/mime": "^2.0.3",
+    "@types/node": "^20.14.0",
+    "jest": "^29.7.0",
+    "serverless": "^4.36.1",
+    "serverless-esbuild": "^1.52.1",
+    "serverless-offline": "^14.4.0",
+    "ts-jest": "^29.1.5",
+    "typescript": "^5.4.5"
+  }
+}

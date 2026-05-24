@@ -1,0 +1,16 @@
+{
+  "version": "2.0",
+  "requestContext": {
+    "http": {
+      "method": "GET",
+      "path": "/api/manifest"
+    }
+  },
+  "headers": {
+    "expo-platform": "ios",
+    "expo-runtime-version": "2",
+    "expo-protocol-version": "1",
+    "expo-current-update-id": "00000000-0000-0000-0000-000000000000"
+  },
+  "queryStringParameters": {}
+}
